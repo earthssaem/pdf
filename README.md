@@ -54,6 +54,10 @@ python -m http.server 8000
 
 | 라이브러리 | 버전 | 라이선스 |
 | --- | --- | --- |
-| MuPDF.js | 1.28.6 | AGPL-3.0-or-later (`lib/mupdf/LICENSE`) |
+| MuPDF.js | 1.28.1 | AGPL-3.0-or-later (`lib/mupdf/LICENSE`) |
 | pdf.js (pdfjs-dist, legacy 빌드) | 6.5.438 | Apache-2.0 (`lib/pdfjs/LICENSE`) |
 | pdf-lib | 1.17.1 | MIT (`lib/pdf-lib/LICENSE.md`) |
+
+### 라이브러리 버전을 올릴 때
+
+MuPDF.js는 일부러 1.28.1에 맞춰 두었습니다. 1.28.6에는 문장 중간의 글자를 지우면 뒤따르는 글자가 한 글자 폭만큼 왼쪽으로 밀리는 문제가 있습니다(LibreOffice가 만든 PDF에서 확인). 버전을 올린 뒤에는 가명 처리한 PDF를 크게 보기로 열어 이름표 뒤 글자가 제자리에 있는지, 적용 후 "검증 통과"가 나오는지 확인하세요.

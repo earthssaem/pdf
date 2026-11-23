@@ -8,6 +8,8 @@
 <meta name="referrer" content="no-referrer">
 <meta name="robots" content="noindex, nofollow">
 <title>PDF 업무 도구</title>
+<!-- 아이콘도 파일 안에 넣어 따로 요청하지 않는다 -->
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%232456c9'/%3E%3Cpath d='M10 7h8l5 5v13H10z' fill='%23fff'/%3E%3Cpath d='M18 7v5h5' fill='none' stroke='%232456c9' stroke-width='1.5'/%3E%3Crect x='12.5' y='16' width='8' height='2.6' fill='%23ffd500'/%3E%3Crect x='12.5' y='20.5' width='5.5' height='1.6' fill='%23b9c0cd'/%3E%3C/svg%3E">
 <style>
 :root {
   --bg: #f3f4f6; --panel: #ffffff; --line: #dfe2e8; --line2: #eceef2;
@@ -311,13 +313,13 @@ dialog::backdrop { background: rgba(20, 25, 38, .5); }
       </div>
       <div id="pii-stale" class="note warn" hidden></div>
       <div class="sec" id="hits-sec" hidden>
-        <div class="row">
+        <div class="row" style="flex-wrap:nowrap">
           <h3 style="margin:0">3. 확인</h3>
-          <span id="hits-count" class="hint"></span>
           <span class="grow"></span>
           <button class="small" id="btn-chk-all">모두 체크</button>
           <button class="small" id="btn-chk-none">모두 해제</button>
         </div>
+        <div id="hits-count" class="hint"></div>
         <div id="hits"></div>
         <div class="hint">글 부분을 누르면 그 페이지를 크게 봅니다. 크게 보기에서 마우스로 끌면 지울 영역을 직접 추가할 수 있습니다(스캔본·사진·서명).</div>
       </div>
@@ -407,11 +409,11 @@ const mupdf = await import(MUPDF_URL);
 const store = new Map(); // "파일ID:판" -> { doc, models, labels }
 const keyOf = (fileId, ver) => fileId + ":" + ver;
 
-function putDoc(fileId, ver, bytes) {
+function putDoc(fileId, ver, bytes, labels) {
   dropDoc(fileId, ver);
   const doc = new mupdf.PDFDocument(bytes);
   if (doc.needsPassword()) { doc.destroy(); throw new Error("암호가 걸린 PDF입니다."); }
-  const entry = { doc, bytes, n: doc.countPages(), models: new Map(), labels: new Map(), hf: null, stats: null };
+  const entry = { doc, bytes, n: doc.countPages(), models: new Map(), labels: labels || new Map(), stats: null };
   store.set(keyOf(fileId, ver), entry);
   return entry;
 }
@@ -457,9 +459,13 @@ function extractModel(entry, idx) {
   const b = page.getBounds();
   const W = b[2] - b[0], H = b[3] - b[1];
   const fontCache = new Map();
+  const lblBoxes = entry.labels.get(idx) || [];
+  const inLabelBox = (x, y) => lblBoxes.some(bx => x >= bx.rect[0] - 0.5 && x <= bx.rect[2] + 0.5 && y >= bx.rect[1] - 0.5 && y <= bx.rect[3] + 0.5);
   const lines = [];
   let cur = null;
-  const st = page.toStructuredText("preserve-whitespace");
+  // 주석·양식 칸에 보이는 글자까지 함께 읽는다(본문만 읽으면 거기 남은 개인정보를 놓친다)
+  const dl = page.toDisplayList(true);
+  const st = dl.toStructuredText("preserve-whitespace");
   st.walk({
     beginLine(bbox, wmode, dir) { cur = { q: quant(dir[0], dir[1]), chars: [] }; },
     onChar(c, origin, font, size, q) {
@@ -470,12 +476,11 @@ function extractModel(entry, idx) {
         fi = { name, bold: font.isBold() || /bold|heavy|black|extrab|[-_ ]B$/i.test(name), lbl: LABEL_FONT_RE.test(name) };
         fontCache.set(font.pointer, fi);
       }
-      cur.chars.push({
-        c,
-        x0: Math.min(q[0], q[2], q[4], q[6]) - b[0], y0: Math.min(q[1], q[3], q[5], q[7]) - b[1],
-        x1: Math.max(q[0], q[2], q[4], q[6]) - b[0], y1: Math.max(q[1], q[3], q[5], q[7]) - b[1],
-        s: size, b: fi.bold, lbl: fi.lbl,
-      });
+      const x0 = Math.min(q[0], q[2], q[4], q[6]) - b[0], y0 = Math.min(q[1], q[3], q[5], q[7]) - b[1];
+      const x1 = Math.max(q[0], q[2], q[4], q[6]) - b[0], y1 = Math.max(q[1], q[3], q[5], q[7]) - b[1];
+      // 이름표로 그려 넣은 글자인지: 이름표 글꼴이고, 이름표 상자 안에 있을 때만
+      const lbl = fi.lbl && lblBoxes.length > 0 && inLabelBox((x0 + x1) / 2, (y0 + y1) / 2);
+      cur.chars.push({ c, x0, y0, x1, y1, s: size, b: fi.bold, lbl });
     },
     endLine() { if (cur && cur.chars.length) lines.push(cur); cur = null; },
   });
@@ -515,10 +520,14 @@ function extractModel(entry, idx) {
       }
     }
   };
+  dl.destroy();
   try {
+    // 콜백으로 받은 객체는 그 자리에서 바로 놓아준다. 나중에 자동 정리되도록 두면
+    // 이미 사라진 메모리를 다시 해제해 워커가 죽을 수 있다.
+    const free = (...objs) => { for (const o of objs) { try { o.destroy(); } catch (e) {} } };
     const dev = new mupdf.Device({
-      fillPath(path, evenOdd, ctm) { collect(path, ctm, true); },
-      strokePath(path, stroke, ctm) { collect(path, ctm, false); },
+      fillPath(path, evenOdd, ctm, cs) { try { collect(path, ctm, true); } finally { free(path, cs); } },
+      strokePath(path, stroke, ctm, cs) { try { collect(path, ctm, false); } finally { free(path, stroke, cs); } },
     });
     page.run(dev, mupdf.Matrix.identity);
     dev.close();
@@ -942,14 +951,17 @@ function opRedact({ fileId, items, strip }, progress) {
     const page = doc.loadPage(p);
     const pobj = page.getObject();
     const its = byPage.get(p) || [];
+    // 이 페이지의 글자 방향(0: 가로, 1: 아래로, 2: 뒤집힘, 3: 위로)
+    const k = its.length ? extractModel(src, p).k : 0;
     if (its.length) {
       const b = page.getBounds();
       for (const it of its) for (const r of it.rects) {
         const a = page.createAnnotation("Redact");
         let rr = r;
         if (it.kind !== "manual") {
-          // 이웃 글자를 건드리지 않게 조금 줄인다
-          const dy = (r[3] - r[1]) * 0.1, dx = Math.min(0.4, (r[2] - r[0]) * 0.03);
+          // 이웃 글자를 건드리지 않게 조금 줄인다: 줄 두께 쪽은 10%, 글자가 이어지는 쪽은 아주 조금
+          const w = r[2] - r[0], h = r[3] - r[1];
+          const dx = k % 2 ? w * 0.1 : Math.min(0.4, w * 0.03), dy = k % 2 ? Math.min(0.4, h * 0.03) : h * 0.1;
           rr = [r[0] + dx, r[1] + dy, r[2] - dx, r[3] - dy];
         }
         a.setRect([rr[0] + b[0], rr[1] + b[1], rr[2] + b[0], rr[3] + b[1]]);
@@ -969,13 +981,19 @@ function opRedact({ fileId, items, strip }, progress) {
           const label = ri === 0 || it.kind === "manual" ? it.label : "";
           s += "0.5 w 0.6 G 0.95 g " + [x + 0.3, y + 0.3, Math.max(0.5, w - 0.6), Math.max(0.5, h - 0.6)].map(num).join(" ") + " re B\n";
           if (label) {
+            // 이름표는 그 페이지의 글자 방향을 따라 눕혀서 쓴다
             const tw = widthOf(label) || 1;
-            let size = Math.min(h * 0.7, (w - 1.5) / tw);
+            const along = k % 2 ? h : w, thick = k % 2 ? w : h;
+            let size = Math.min(thick * 0.7, (along - 1.5) / tw);
             if (it.kind === "manual") size = Math.min(size, 10);
             size = Math.max(size, 2);
-            const tx = x + (w - tw * size) / 2, ty = y + h / 2 + size * 0.36;
-            s += "BT /PiiLbl " + num(size) + " Tf 0.2 g 1 0 0 -1 " + num(tx) + " " + num(ty) + " Tm " + hexOf(label) + " Tj ET\n";
-            const tr = it.kind === "manual" ? [tx - b[0], ty - size - b[1], tx + tw * size - b[0], ty + size * 0.2 - b[1]] : r;
+            const X = [[1, 0], [0, 1], [-1, 0], [0, -1]][k], U = [[0, -1], [1, 0], [0, 1], [-1, 0]][k];
+            const half = tw * size / 2, cx = x + w / 2, cy = y + h / 2;
+            const tx = cx - half * X[0] - 0.36 * size * U[0], ty = cy - half * X[1] - 0.36 * size * U[1];
+            s += "BT /PiiLbl " + num(size) + " Tf 0.2 g " + [X[0], X[1], U[0], U[1], tx, ty].map(num).join(" ") + " Tm " + hexOf(label) + " Tj ET\n";
+            // Markdown에서 이 이름표를 끼워 넣을 자리(직접 그린 영역은 글자가 놓인 띠만)
+            const hx = Math.abs(half * X[0]) + Math.abs(0.6 * size * U[0]), hy = Math.abs(half * X[1]) + Math.abs(0.6 * size * U[1]);
+            const tr = it.kind === "manual" ? [cx - hx - b[0], cy - hy - b[1], cx + hx - b[0], cy + hy - b[1]] : r;
             boxes.push({ rect: r, textRect: tr, label, kind: it.kind || "text" });
           } else boxes.push({ rect: r, textRect: null, label: "", kind: it.kind || "text" });
         });
@@ -1016,16 +1034,18 @@ function opRedact({ fileId, items, strip }, progress) {
   const out = doc.saveToBuffer("garbage=4,compress=yes").asUint8Array().slice();
   doc.destroy();
   if (lf) lf.tmp.destroy();
-  const entry = putDoc(fileId, "red", out);
-  entry.labels = labelBoxes;
+  putDoc(fileId, "red", out, labelBoxes);
   return { bytes: out };
 }
 
 /* ───────────── 검증: 지운 뒤에 원래 문자열이 남았는지 ───────────── */
-function opVerify({ fileId, cfg, strings, manual }, progress) {
+// strings: 모든 페이지에서 찾아볼 문자열(이름), pageStrings: 그 페이지에서 지운 문자열
+function opVerify({ fileId, cfg, strings, pageStrings, areas }, progress) {
   const entry = getEntry(fileId, "red");
   const matchers = buildMatchers(cfg);
-  const hits = [], found = [], manualLeft = [];
+  const hits = [], found = [], left = [];
+  const byPage = new Map();
+  for (const a of (areas || [])) { if (!byPage.has(a.page)) byPage.set(a.page, []); byPage.get(a.page).push(a); }
   for (let i = 0; i < entry.n; i++) {
     const model = extractModel(entry, i);
     hits.push(...detectPage(model, matchers));
@@ -1033,7 +1053,7 @@ function opVerify({ fileId, cfg, strings, manual }, progress) {
     if (model.nchars) {
       const page = entry.doc.loadPage(i);
       const b = page.getBounds();
-      for (const s of strings) {
+      for (const s of new Set([...(strings || []), ...((pageStrings && pageStrings[i]) || [])])) {
         let res = [];
         try { res = page.search(s) || []; } catch (e) {}
         for (const quads of res) {
@@ -1044,21 +1064,20 @@ function opVerify({ fileId, cfg, strings, manual }, progress) {
       }
       page.destroy();
     }
-    // 직접 그린 영역 안에 글자가 남았는지
-    for (const m of (manual || [])) {
-      if (m.page !== i) continue;
-      const r = rectFwd(model.k, model.W, model.H, m.rect);
-      let left = "";
+    // 지운 자리(탐지한 곳과 직접 그린 영역) 안에 글자가 일부라도 남았는지
+    for (const a of (byPage.get(i) || [])) {
+      const r = rectFwd(model.k, model.W, model.H, a.rect);
+      let rest = "";
       for (const f of model.frags) for (const ch of f.chars) {
         if (ch.lbl || !ch.c.trim()) continue;
         const cx = (ch.x0 + ch.x1) / 2, cy = (ch.y0 + ch.y1) / 2;
-        if (cx > r[0] && cx < r[2] && cy > r[1] && cy < r[3]) left += ch.c;
+        if (cx > r[0] && cx < r[2] && cy > r[1] && cy < r[3]) rest += ch.c;
       }
-      if (left) manualLeft.push({ page: i, text: left.slice(0, 20), rects: [m.rect] });
+      if (rest) left.push({ page: i, text: rest.slice(0, 20), rects: [a.rect] });
     }
     progress(i + 1, entry.n);
   }
-  return { hits, found, manualLeft };
+  return { hits, found, left };
 }
 
 /* ───────────── Markdown 변환 ───────────── */
@@ -1070,14 +1089,9 @@ function fragsForMarkdown(entry, model) {
   const boxes = entry.labels.get(model.idx);
   if (!boxes || !boxes.length) return model.frags;
   const out = [];
-  const inBox = ch => {
-    const cx = (ch.x0 + ch.x1) / 2, cy = (ch.y0 + ch.y1) / 2;
-    return boxes.some(bx => { const r = bx._r; return cx >= r[0] && cx <= r[2] && cy >= r[1] && cy <= r[3]; });
-  };
-  for (const bx of boxes) bx._r = rectFwd(model.k, model.W, model.H, bx.rect);
   for (const f of model.frags) {
-    if (!f.lbl) { out.push(f); continue; }
-    const keep = f.chars.filter(ch => !inBox(ch));
+    if (!f.chars.some(ch => ch.lbl)) { out.push(f); continue; }
+    const keep = f.chars.filter(ch => !ch.lbl);
     const nf = makeFrag(keep);
     if (nf) out.push(nf);
   }
@@ -1118,7 +1132,7 @@ function fileStats(entry) {
   if (entry.stats) return entry.stats;
   const counts = new Map(), sizes = new Map();
   const zoneKey = (r, L) => {
-    const top = r.y1 < L.UH * 0.11, bot = r.y0 > L.UH * 0.89;
+    const top = r.y1 < L.UH * 0.1, bot = r.y0 > L.UH * 0.9;
     if (!top && !bot) return null;
     return (top ? "T" : "B") + Math.round(r.cy / 6) + "|" + r.text.replace(/\d+/g, "#").replace(/\s+/g, "");
   };
@@ -1151,6 +1165,21 @@ const cellEsc = s => s.replace(/\|/g, "\\|");
 // 줄을 이을 때 넣을 글자: 기본은 공백, 숫자-숫자처럼 붙임표에서 끊긴 곳은 붙인다
 const glue = (a, b, opts) => (opts.noSpace || (/[0-9A-Za-z][-–]$/.test(a) && /^[0-9A-Za-z]/.test(b)) ? "" : " ");
 
+function firstWordWidth(r) {
+  let x0 = null, x1 = null;
+  for (let i = 0; i < r.map.length; i++) {
+    const ch = r.map[i];
+    if (!ch) { if (x0 !== null) break; continue; }
+    if (x0 === null) x0 = ch.x0;
+    x1 = ch.x1;
+  }
+  return x0 === null ? 0 : x1 - x0;
+}
+function isWrapped(prev, next, right) {
+  if (prev.x1 >= right - Math.max(2.2 * prev.size, 10)) return true;
+  return prev.x1 + 0.25 * prev.size + firstWordWidth(next) > right - 0.3 * prev.size;
+}
+
 function joinRows(rows, right, opts, br) {
   // 칸이나 문단 안의 여러 줄을 잇는다. 줄이 오른쪽 끝까지 찼으면 이어진 문장으로 본다.
   let out = "";
@@ -1159,8 +1188,7 @@ function joinRows(rows, right, opts, br) {
     if (!r.text) continue;
     if (prev === null) out = r.text;
     else {
-      const full = prev.x1 >= right - Math.max(2.2 * prev.size, 10);
-      if (full && !LIST_RE.test(r.text)) out += glue(out, r.text, opts) + r.text;
+      if (isWrapped(prev, r, right) && !LIST_RE.test(r.text)) out += glue(out, r.text, opts) + r.text;
       else out += br + r.text;
     }
     prev = r;
@@ -1172,7 +1200,7 @@ function tableToMd(t, opts) {
   const grid = Array.from({ length: t.R }, () => Array(t.C).fill(""));
   let filled = 0;
   for (const c of t.cells) {
-    const txt = joinRows(c.rows, c.x1 - 1, opts, "<br>");
+    const txt = joinRows(c.rows, c.x1 - 3, opts, "<br>");
     if (txt) { grid[c.r0][c.c0] = cellEsc(txt); filled++; }
   }
   // 완전히 빈 행·열은 뺀다
@@ -1240,7 +1268,11 @@ function findLooseTables(rows) {
     // 끝에 붙은 한 칸짜리 줄은 표에서 뺀다
     while (j > i && rows[j - 1].cells.length < 2) j--;
     const ncol = rivers ? rivers.length + 1 : 0;
-    if (j - i >= 2 && (multi >= 3 || (multi >= 2 && ncol >= 3))) { out.push({ from: i, to: j, rivers: rivers.slice().sort((a, b) => a[0] - b[0]), ok: true }); i = j; }
+    let same = 0;
+    for (let k = i; k < j; k++) if (rows[k].cells.length === ncol) same++;
+    const looksTable = j - i >= 2 && (multi >= 3 || (multi >= 2 && ncol >= 3));
+    if (looksTable && same >= 0.6 * multi) { out.push({ from: i, to: j, rivers: rivers.slice().sort((a, b) => a[0] - b[0]), ok: true }); i = j; }
+    else if (looksTable && multi >= 3) { out.push({ from: i, to: j, ok: false }); i = j; } // 칸 수가 들쭉날쭉하면 확인 필요
     else {
       // 여러 칸짜리 줄이 3줄 넘게 이어지는데 열이 안 맞으면 확인 필요
       let k2 = i;
@@ -1287,6 +1319,7 @@ function pageToMd(entry, idx, opts) {
   let rows = L.rows.filter(r => {
     const k = st.zoneKey(r, L);
     if (!k) return true;
+    if (r.size > st.body * 1.08) return true; // 본문보다 큰 글자는 제목일 수 있으니 남긴다
     if (st.repeated.has(k)) return false;
     if (PAGENO_RE.test(r.text.trim())) return false;
     return true;
@@ -1353,8 +1386,7 @@ function pageToMd(entry, idx, opts) {
       const sizeOk = Math.abs(r.size - prev.size) <= 0.6;
       if (para.heading) cont = gapOk && sizeOk;
       else {
-        const full = prev.x1 >= right - Math.max(2.2 * prev.size, 10);
-        cont = gapOk && sizeOk && full && !r.odd && !prev.odd;
+        cont = gapOk && sizeOk && isWrapped(prev, r, right) && !r.odd && !prev.odd;
         if (cont && para.rows.length >= 2) {
           // 둘째 줄 왼쪽 끝과 다르게 들여 쓰거나 내어 쓰면 새 문단
           const base = para.rows[1].x0;
@@ -2044,12 +2076,20 @@ async function runApply() {
     const fails = [];
     const allowed = (fid, h) => P.hits.some(u => u.f === fid && u.page === h.page && !u.checked && rectsHit(u.rects, h.rects));
     for (const f of files) {
-      const strings = [...new Set([...P.cfg.names.map(n => n.name), ...P.hits.filter(h => h.f === f.id && h.checked).map(h => h.text.trim())])].filter(s => s.length >= 2 && !/\s/.test(s));
-      const res = await call("verify", { fileId: f.id, cfg: P.cfg, strings, manual: P.manual.filter(m => m.f === f.id).map(m => ({ page: m.page, rect: m.rect })) });
+      const usable = s => s.length >= 2 && !/\s/.test(s);
+      const strings = P.cfg.names.map(n => n.name).filter(usable);
+      const pageStrings = {};
+      for (const h of P.hits) if (h.f === f.id && h.checked && usable(h.text.trim())) (pageStrings[h.page] ||= new Set()).add(h.text.trim());
+      for (const k in pageStrings) pageStrings[k] = [...pageStrings[k]];
+      const areas = [];
+      for (const h of P.hits) if (h.f === f.id && h.checked) for (const r of h.rects) areas.push({ page: h.page, rect: r });
+      for (const m of P.manual) if (m.f === f.id) areas.push({ page: m.page, rect: m.rect });
+      const prog = (d, t) => b.set(`지운 결과를 검증하는 중… ${baseName(f.name)} ${d}/${t}쪽`);
+      const res = await call("verify", { fileId: f.id, cfg: P.cfg, strings, pageStrings, areas }, prog);
       const push = (h, why) => { if (!fails.some(x => x.f === f.id && x.page === h.page && rectsHit(x.rects, h.rects))) fails.push({ f: f.id, page: h.page, text: h.text, rects: h.rects, why }); };
       for (const h of res.hits) if (!allowed(f.id, h)) push(h, "글자가 남아 있음");
       for (const h of res.found) if (!allowed(f.id, h)) push(h, "글자가 남아 있음");
-      for (const h of res.manualLeft) push(h, "직접 그린 영역 안에 글자가 남아 있음");
+      for (const h of res.left) push(h, "지운 자리에 글자가 남아 있음");
     }
     P.failures = fails;
     P.state = "applied"; P.dirty = false;
@@ -2104,7 +2144,7 @@ function renderPiiState() {
     const fails = blockingFailures();
     if (fails.length) {
       const n = el("div", "note bad");
-      n.append(el("b", "", `검증 실패: ${fails.length}곳에 원문이 남아 있습니다.`), document.createTextNode(" 저장과 복사를 막았습니다. 아래 위치를 눌러 확인한 뒤, 크게 보기에서 영역을 직접 그려 다시 적용하세요."));
+      n.append(el("b", "", `검증 실패: ${fails.length}곳에 원문이 남아 있습니다.`), document.createTextNode(" 저장과 복사를 막았습니다. 아래 위치를 눌러 확인한 뒤, 크게 보기에서 영역을 직접 그려 다시 적용하세요." + (P.applied.strip ? "" : " 주석이나 양식 칸에 든 글자라면 ‘문서 부속 정보 제거’를 켜고 다시 적용하면 지워집니다.")));
       const ul = el("ul"); ul.id = "fails";
       for (const x of fails) {
         const li = el("li", "", `p.${posOf(x.f, x.page) + 1} «${x.text}» — ${x.why}`);
@@ -2125,6 +2165,9 @@ function renderPiiState() {
 
 const VARIANT = { spaced: "띄어 씀", given: "이름만", wrapped: "줄 바뀜" };
 function renderHits() {
+  // 목록이 길 수 있으니 개인정보 탭이 보일 때만 다시 그린다
+  if (S.tab !== "pii") { P.listStale = true; return; }
+  P.listStale = false;
   const box = $("#hits");
   box.replaceChildren();
   const rows = [];
@@ -2138,6 +2181,7 @@ function renderHits() {
     if (r.h) {
       const h = r.h;
       row.classList.toggle("off", !h.checked);
+      h._row = row;
       const cb = el("input"); cb.type = "checkbox"; cb.checked = h.checked; cb.title = "체크한 곳만 지웁니다";
       cb.onchange = () => { setChecked(h, cb.checked); };
       const ctx = el("span", "ctx");
@@ -2164,8 +2208,14 @@ function renderHits() {
 function setChecked(h, v) {
   h.checked = v;
   P.overrides.set(h.key, v);
+  const wasDirty = P.dirty;
   if (isApplied()) P.dirty = true;
-  renderHits(); renderPiiState(); renderMarks(); renderMd();
+  // 그 줄과 그 페이지의 표시만 고친다
+  if (h._row && h._row.isConnected) { h._row.classList.toggle("off", !v); $("input[type=checkbox]", h._row).checked = v; }
+  else renderHits();
+  renderPiiState(); renderMd();
+  if (P.dirty !== wasDirty) renderMarks();
+  else { const p = S.pages[posOf(h.f, h.page)], t = p && thumbEls.get(p.id); if (t) drawMarksFor(p, $(".marks", t), false); }
   if (viewer.open) drawViewerMarks();
 }
 function removeManual(m) {
@@ -2176,6 +2226,14 @@ function removeManual(m) {
 }
 
 /* 노란 표시 */
+let hitIndex = null, hitIndexOf = null;
+function hitsOn(fid, i) {
+  if (hitIndexOf !== P.hits) {
+    hitIndex = new Map(); hitIndexOf = P.hits;
+    for (const h of P.hits) { const k = h.f + "|" + h.page; if (!hitIndex.has(k)) hitIndex.set(k, []); hitIndex.get(k).push(h); }
+  }
+  return hitIndex.get(fid + "|" + i) || [];
+}
 function drawMarksFor(p, box, interactive, focusRects) {
   const f = fileOf(p), d = f.dims.get(p.i);
   box.replaceChildren();
@@ -2189,8 +2247,7 @@ function drawMarksFor(p, box, interactive, focusRects) {
     return m;
   };
   if (showHits) {
-    for (const h of P.hits) {
-      if (h.f !== p.f || h.page !== p.i) continue;
+    for (const h of hitsOn(p.f, p.i)) {
       for (const r of h.rects) {
         const m = add(r, h.checked ? "on" : "off");
         if (interactive) { m.title = `${h.text} → ${labelFor(h)} (눌러서 ${h.checked ? "해제" : "체크"})`; m.onclick = e => { e.stopPropagation(); setChecked(h, !h.checked); }; }
@@ -2217,7 +2274,7 @@ function drawMarksFor(p, box, interactive, focusRects) {
 function renderMarks() {
   for (const p of S.pages) {
     const t = thumbEls.get(p.id);
-    if (t) drawMarksFor(p, $(".marks", t), false);
+    if (t && t._done) drawMarksFor(p, $(".marks", t), false); // 아직 안 그린 썸네일은 그릴 때 함께 표시한다
   }
 }
 
@@ -2326,9 +2383,10 @@ window.addEventListener("mouseup", () => {
   const p = S.pages.find(x => x.id === V.id);
   if (!p) return;
   P.manual.push({ f: p.f, page: p.i, rect, label: "[가림]" });
-  if (P.state === "none") { P.state = "detected"; }
   if (isApplied()) P.dirty = true;
   renderHits(); renderPiiState(); renderMarks(); renderMd(); drawViewerMarks();
+  // 탐지 전에 영역부터 그렸으면 탐지를 한 번 돌려 둔다(적용과 검증에 필요)
+  if (P.state === "none") runDetect().then(() => { if (viewer.open) drawViewerMarks(); });
   toast("지울 영역을 추가했습니다. 개인정보 탭에서 ‘적용’을 누르면 지워집니다.");
 });
 
@@ -2474,6 +2532,7 @@ function setTab(name) {
   for (const t of $$(".tab")) t.setAttribute("aria-selected", t.dataset.tab === name);
   for (const p of $$(".pane")) p.classList.toggle("on", p.id === "pane-" + name);
   if (name === "pii" || name === "md") getWorker().catch(() => {});
+  if (name === "pii" && P.listStale) renderHits();
   if (name === "md") { renderMd(); if (!M.done && S.pages.length) runMarkdown(); }
   if (name === "rs") renderRestore();
 }
